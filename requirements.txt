@@ -1,0 +1,9 @@
+# Core (needed now)
+PySide6-Essentials>=6.6,<6.13      # Qt 6.12 is the last release that supports Windows 10; your Windows 10 1903 needs Qt 6.x (1809 or later)
+opencv-python-headless>=4.8        # headless build avoids a Qt plug-in clash with PySide6
+numpy>=1.24
+psutil>=5.9
+
+# Optional (add when you want them)
+# sounddevice>=0.4                 # microphone input for the audio monitor
+# ultralytics                      # YOLO11n detector plug-in (AGPL-3.0: release your code under AGPL-3.0 or buy a licence)
