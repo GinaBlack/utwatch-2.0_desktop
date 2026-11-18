@@ -9,7 +9,7 @@ from PySide6.QtGui import QImage
 
 from ..pipeline.calibration import Calibration
 from ..pipeline.engine import CameraEngine
-from ..pipeline.source import VideoSource
+from ..pipeline.source import VideoSource, is_nearly_black_frame
 
 DISPLAY_FPS = 20.0
 
@@ -52,6 +52,7 @@ class CameraWorker(QThread):
         t_wall0, t_media = time.time(), None
         last_display, frames, fps_t0, fps = 0.0, 0, time.time(), 0.0
         last_status = 0.0
+        dark_since = None
         manual_stop = False
         while not self._stop:
             self._drain(engine)
@@ -65,6 +66,10 @@ class CameraWorker(QThread):
                 engine.reset_scene()
             self.last_raw = raw
             now = time.time()
+            if is_nearly_black_frame(raw):
+                dark_since = dark_since or now
+            else:
+                dark_since = None
             res = engine.process(now, raw)
             frames += 1
             if now - fps_t0 >= 1.0:
@@ -80,7 +85,17 @@ class CameraWorker(QThread):
                 self.recording.emit(r)
             if now - last_status >= 1.0:
                 last_status = now
-                self._emit_status(engine, src, fps, res["stage"], False, res)
+                if dark_since is not None and now - dark_since >= 3.0:
+                    self.status.emit(self.cam_id, {
+                        "state": "warning", "fps": round(fps, 1),
+                        "message": "Connected, but the image is nearly black. Low light or lens obstruction is possible; this does not prove a connection failure.",
+                        "timings": {k: round(v, 1) for k, v in engine.timings.items()},
+                        "analysed": engine.analysed, "vehicles": engine.stats.current,
+                        "level": engine.stats.level, "recording": engine.recorder.recording_manually,
+                        "notes": list(engine.notes), "detector": engine.detector.name,
+                        "temporal": engine.temporal.name, "tracks": len(engine.last_tracks)})
+                else:
+                    self._emit_status(engine, src, fps, res["stage"], False, res)
             # pace files and webcams to their native rate so playback runs at real-time speed
             if src.kind == "file":
                 target = 1.0 / src.fps

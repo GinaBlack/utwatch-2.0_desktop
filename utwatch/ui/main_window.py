@@ -14,6 +14,7 @@ from .. import config, reports
 from ..audio import AudioMonitor
 from ..models import Severity, can
 from ..pipeline.calibration import Calibration
+from ..pipeline.source import classify_source
 from . import dialogs
 from .pages import (AdminPage, DashboardPage, DiagnosticsPage, GalleryPage, HistoryPage, MapPage, ReportsPage, save_report_pdf)
 from .theme import SEVERITY_COLOURS
@@ -186,14 +187,19 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------ settings
     def open_settings(self):
         if dialogs.SettingsDialog(self.db, self).exec():
+            old_settings = self.settings
             self.settings = self.db.get_settings()
             cams = {c["id"]: c for c in self.db.cameras()}
             for cid, w in self.workers.items():
                 w.command("settings", (self.settings, cams.get(cid, w.camera)))
             self.audio.stop(); self.audio.s = dict(self.settings); self.audio.start()
             self.db.audit(self.user["username"], "change settings")
-            self.toast.show_message("Settings saved. Model changes apply after cameras restart.", config.BRAND["green"])
-            self.restart_cameras()
+            model_keys = ("detector", "detector_weights", "temporal", "temporal_weights", "audio", "audio_weights")
+            model_changed = any(old_settings[k] != self.settings[k] for k in model_keys)
+            if model_changed:
+                self.restart_cameras()
+            self.toast.show_message("Settings saved." + (" Model changes applied after cameras restarted." if model_changed else ""),
+                                    config.BRAND["green"])
 
     # ------------------------------------------------------------ audio
     def _audio_score(self, score: float):
@@ -206,25 +212,51 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------ signals from cameras
     def on_status(self, cam_id: int, st: dict):
+        old = self.statuses.get(cam_id, {})
         self.statuses[cam_id] = st
         self.last_seen[cam_id] = time.time()
         self.dashboard.update_status(self.statuses)
         self.map.set_states({cid: s.get("state", "ok") for cid, s in self.statuses.items()})
-        if st.get("state") == "error" and st.get("message"):
-            self.toast.show_message(st["message"], config.BRAND["red"])
+        if st.get("state") in ("error", "reconnecting", "warning") and st.get("message") and (
+                old.get("state") != st.get("state") or old.get("message") != st.get("message")):
+            colour = config.BRAND["red"] if st["state"] == "error" else config.BRAND["amber"]
+            self.toast.show_message(st["message"], colour, 8000)
 
     def on_bucket(self, cam_id: int, b: dict):
         self.db.add_stat(cam_id, b["minute_ts"], b["avg"], b["max"], b["congestion"])
         rows = self.db.stats_since(time.time() - 3600)
-        per_min: dict[int, float] = {}
-        for r in rows: per_min[r["minute_ts"]] = per_min.get(r["minute_ts"], 0) + r["vehicles_avg"]
-        self.dashboard.set_chart([per_min[k] for k in sorted(per_min)][-60:])
+        end_minute = int(time.time() // 60) * 60
+        minutes = [end_minute - (59 - i) * 60 for i in range(60)]
+        minute_index = {minute: i for i, minute in enumerate(minutes)}
+        camera_names = {c["id"]: c["name"] for c in self.db.cameras()}
+        series = {name: [{"avg": 0.0, "max": 0, "congestion": "low"} for _ in minutes]
+                  for name in camera_names.values()}
+        for row in rows:
+            index = minute_index.get(row["minute_ts"])
+            name = camera_names.get(row["camera_id"])
+            if index is not None and name in series:
+                series[name][index] = {"avg": row["vehicles_avg"] or 0.0, "max": row["vehicles_max"] or 0,
+                                       "congestion": row["congestion"] or "low"}
+        self.dashboard.set_chart(minutes, series)
 
     def on_recording(self, r: dict):
         self.db.add_recording(r)
         self.gallery.refresh()
 
     def on_alert(self, a: dict):
+        if a["type"] == "accident" and a.get("incident_id"):
+            camera = next((c for c in self.db.cameras() if c["id"] == a.get("camera_id")), {})
+            details = a.setdefault("details", {})
+            details["camera_details"] = {
+                "id": camera.get("id"), "name": camera.get("name", a.get("camera_name")),
+                "source_type": classify_source(camera.get("source", "")),
+                "latitude": camera.get("lat"), "longitude": camera.get("lon"),
+                "speed_limit_kmh": camera.get("speed_limit_kmh"),
+            }
+            self.db.upsert_incident_report(a)
+            self._write_incident_report(a["incident_id"])
+            if details.get("snapshot_error"):
+                self.toast.show_message(details["snapshot_error"], config.BRAND["red"])
         aid = self.db.add_alert(a)
         self._log_jsonl(a)
         self._present(a, aid)
@@ -245,6 +277,19 @@ class MainWindow(QMainWindow):
         if self.tray and sev >= Severity.HIGH:
             self.tray.showMessage("UTWatch", f"{a['message']}: {a['camera_name']}")
         self.refresh_counts()
+
+    def _write_incident_report(self, incident_id: str):
+        report = self.db.incident_report(incident_id)
+        if not report:
+            return
+        folder = config.sub_dir("reports") / "incidents"
+        folder.mkdir(parents=True, exist_ok=True)
+        path = Path(report["snapshot_path"]).with_suffix(".json") if report["snapshot_path"] else folder / f"{incident_id}.json"
+        try:
+            path.write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
+        except OSError:
+            logging.getLogger("utwatch").exception("Could not write incident report %s", path)
+            self.toast.show_message(f"Could not write incident report: {path}", config.BRAND["red"])
 
     def _beep(self, n: int):
         for i in range(n):
@@ -267,7 +312,10 @@ class MainWindow(QMainWindow):
     def acknowledge(self, alert_id: int):
         if not can(self.role, "acknowledge"):
             return
+        if alert_id is None:
+            return
         self.db.acknowledge(alert_id, self.user["username"])
+        self.dashboard.mark_acknowledged(alert_id, self.user["username"])
         self.db.audit(self.user["username"], "acknowledge alert", str(alert_id))
         self.refresh_counts()
 

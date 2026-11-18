@@ -30,7 +30,8 @@ class AudioMonitor(QObject):
 
     def configure(self, settings: dict):
         self.s = dict(settings)
-        self.classifier, warn = plugins.create_audio(self.s["audio"], self.s["audio_weights"])
+        self.classifier, warn = plugins.create_audio(
+            self.s["audio"], self.s["audio_weights"], self.s["audio_scaler_weights"])
         if warn:
             self.status.emit(warn, False)
 

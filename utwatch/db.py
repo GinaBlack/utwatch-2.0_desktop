@@ -16,6 +16,10 @@ CREATE TABLE IF NOT EXISTS users(
   id INTEGER PRIMARY KEY, username TEXT UNIQUE NOT NULL, salt BLOB NOT NULL, pw_hash TEXT NOT NULL,
   role TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1, approved INTEGER NOT NULL DEFAULT 1,
   failed INTEGER NOT NULL DEFAULT 0, locked_until REAL NOT NULL DEFAULT 0, created REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS registration_keys(
+  role TEXT PRIMARY KEY, salt BLOB NOT NULL, pw_hash TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS system_owner(
+  id INTEGER PRIMARY KEY CHECK(id=1), user_id INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS cameras(
   id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL, source TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1,
   lat REAL, lon REAL, map_x REAL, map_y REAL, speed_limit_kmh REAL, calibration TEXT, zones TEXT);
@@ -24,6 +28,10 @@ CREATE TABLE IF NOT EXISTS alerts(
   severity INTEGER NOT NULL, stage TEXT NOT NULL, incident_id TEXT, message TEXT, details TEXT,
   ack_by TEXT, ack_ts REAL);
 CREATE INDEX IF NOT EXISTS idx_alerts_ts ON alerts(ts);
+CREATE TABLE IF NOT EXISTS incident_reports(
+  incident_id TEXT PRIMARY KEY, ts REAL NOT NULL, camera_id INTEGER, camera_name TEXT,
+  stage TEXT NOT NULL, severity INTEGER NOT NULL, snapshot_path TEXT, scene_bbox TEXT, details TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_incident_reports_ts ON incident_reports(ts);
 CREATE TABLE IF NOT EXISTS recordings(
   id INTEGER PRIMARY KEY, camera_id INTEGER, camera_name TEXT, path TEXT NOT NULL, thumb TEXT, ts REAL NOT NULL,
   duration REAL, size INTEGER, incident_id TEXT, kind TEXT, protected INTEGER NOT NULL DEFAULT 0);
@@ -47,6 +55,9 @@ class Database:
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.executescript(SCHEMA)
+        first_admin = self.conn.execute("SELECT id FROM users WHERE role='administrator' ORDER BY id LIMIT 1").fetchone()
+        if first_admin:
+            self.conn.execute("INSERT OR IGNORE INTO system_owner(id,user_id) VALUES(1,?)", (first_admin["id"],))
         self.conn.commit()
 
     def close(self):
@@ -88,7 +99,36 @@ class Database:
                 (username, salt, security.hash_password(password, salt), role, int(approved), time.time()))
         except sqlite3.IntegrityError:
             raise ValueError("That username is taken")
+        if role == "administrator" and self.conn.execute("SELECT 1 FROM system_owner WHERE id=1").fetchone() is None:
+            self.conn.execute("INSERT INTO system_owner(id,user_id) VALUES(1,?)", (self.conn.execute(
+                "SELECT id FROM users WHERE username=?", (username,)).fetchone()["id"],))
         self.conn.commit()
+
+    def owner_user_id(self):
+        row = self.conn.execute("SELECT user_id FROM system_owner WHERE id=1").fetchone()
+        return row["user_id"] if row else None
+
+    def set_registration_key(self, role: str, key: str, actor_id: int):
+        if role not in ROLES:
+            raise ValueError("Unknown role")
+        if actor_id != self.owner_user_id():
+            raise AuthError("Only the first administrator can change registration keys")
+        security.check_password_rules(key)
+        salt = security.new_salt()
+        self.conn.execute(
+            "INSERT INTO registration_keys(role,salt,pw_hash) VALUES(?,?,?) "
+            "ON CONFLICT(role) DO UPDATE SET salt=excluded.salt,pw_hash=excluded.pw_hash",
+            (role, salt, security.hash_password(key, salt)))
+        self.conn.commit()
+
+    def registration_key_configured(self, role: str) -> bool:
+        return self.conn.execute("SELECT 1 FROM registration_keys WHERE role=?", (role,)).fetchone() is not None
+
+    def register_user(self, username: str, password: str, role: str, key: str):
+        row = self.conn.execute("SELECT salt,pw_hash FROM registration_keys WHERE role=?", (role,)).fetchone()
+        if row is None or not security.verify_password(key, row["salt"], row["pw_hash"]):
+            raise AuthError("The registration key is invalid for that role")
+        self.create_user(username, password, role)
 
     def authenticate(self, username: str, password: str) -> dict:
         row = self.conn.execute("SELECT * FROM users WHERE username=?", (username.strip(),)).fetchone()
@@ -120,6 +160,9 @@ class Database:
     def update_user(self, user_id: int, **fields):
         allowed = {"role", "active", "approved"}
         sets, vals = [], []
+        owner_id = self.owner_user_id()
+        if user_id == owner_id and (fields.get("role", "administrator") != "administrator" or fields.get("active", 1) == 0):
+            raise ValueError("The first administrator must remain active with the administrator role")
         for k, v in fields.items():
             if k not in allowed:
                 raise ValueError("Cannot change " + k)
@@ -192,6 +235,47 @@ class Database:
              a.get("incident_id"), a.get("message", ""), config.dumps(a.get("details", {}))))
         self.conn.commit()
         return cur.lastrowid
+
+    def upsert_incident_report(self, alert: dict):
+        iid = alert.get("incident_id")
+        if not iid:
+            raise ValueError("Incident report requires an incident ID")
+        details = alert.get("details", {})
+        existing = self.conn.execute(
+            "SELECT details,snapshot_path,scene_bbox FROM incident_reports WHERE incident_id=?", (iid,)).fetchone()
+        if existing:
+            details = {**json.loads(existing["details"]), **details}
+        snapshot_path = details.get("snapshot_path") or (existing["snapshot_path"] if existing else None)
+        scene_bbox = details.get("scene_bbox")
+        if scene_bbox is None and existing:
+            scene_bbox = json.loads(existing["scene_bbox"]) if existing["scene_bbox"] else None
+        self.conn.execute(
+            "INSERT INTO incident_reports(incident_id,ts,camera_id,camera_name,stage,severity,snapshot_path,scene_bbox,details) "
+            "VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(incident_id) DO UPDATE SET "
+            "stage=excluded.stage,severity=excluded.severity,details=excluded.details",
+            (iid, alert["ts"], alert.get("camera_id"), alert.get("camera_name"), alert["stage"],
+             int(alert["severity"]), snapshot_path,
+             config.dumps(scene_bbox) if scene_bbox is not None else None,
+             config.dumps(details)))
+        self.conn.commit()
+
+    def incident_reports(self, limit=500):
+        rows = self.conn.execute("SELECT * FROM incident_reports ORDER BY ts DESC LIMIT ?", (limit,))
+        out = []
+        for row in rows:
+            out.append(self._incident_report_dict(row))
+        return out
+
+    @staticmethod
+    def _incident_report_dict(row):
+        item = dict(row)
+        item["scene_bbox"] = json.loads(item["scene_bbox"]) if item["scene_bbox"] else None
+        item["details"] = json.loads(item["details"])
+        return item
+
+    def incident_report(self, incident_id: str):
+        row = self.conn.execute("SELECT * FROM incident_reports WHERE incident_id=?", (incident_id,)).fetchone()
+        return self._incident_report_dict(row) if row else None
 
     def acknowledge(self, alert_id: int, username: str):
         self.conn.execute("UPDATE alerts SET ack_by=?, ack_ts=? WHERE id=?", (username, time.time(), alert_id))

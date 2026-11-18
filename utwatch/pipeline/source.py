@@ -15,6 +15,14 @@ def classify_source(source: str) -> str:
     return "file"
 
 
+def is_nearly_black_frame(frame) -> bool:
+    """Detect an almost uniformly black image without treating it as a disconnection."""
+    probe = frame[::32, ::32]
+    mean_luma = sum(cv2.mean(probe)[:3]) / 3
+    deviation = float(cv2.meanStdDev(probe)[1].mean())
+    return mean_luma < 3 and deviation < 2
+
+
 class VideoSource:
     def __init__(self, source: str, loop_files: bool = True):
         self.source = str(source).strip()

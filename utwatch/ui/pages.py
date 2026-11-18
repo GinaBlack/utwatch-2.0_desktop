@@ -67,19 +67,19 @@ class DashboardPage(QWidget):
         side = QFrame(); side.setObjectName("panel"); side.setFixedWidth(360)
         sl = QVBoxLayout(side); sl.setContentsMargins(12, 12, 12, 12)
         cards = QGridLayout(); cards.setSpacing(8)
-        self.c_veh, self.c_cong = StatCard("Vehicles in view"), StatCard("Congestion")
+        self.c_cong = StatCard("Congestion")
         self.c_conf, self.c_open = StatCard("Confirmed today"), StatCard("Unacknowledged")
-        for i, c in enumerate((self.c_veh, self.c_cong, self.c_conf, self.c_open)):
+        for i, c in enumerate((self.c_cong, self.c_conf, self.c_open)):
             cards.addWidget(c, i // 2, i % 2)
         sl.addLayout(cards)
-        sl.addWidget(QLabel("Vehicles per minute")); self.chart = BarChart(); sl.addWidget(self.chart)
+        sl.addWidget(QLabel("Traffic by camera — average and peak vehicles per minute")); self.chart = BarChart(); sl.addWidget(self.chart)
         sl.addWidget(QLabel("Recent alerts"))
         self.alerts = SeverityList(); sl.addWidget(self.alerts, 1)
         self.ack_btn = QPushButton("Acknowledge selected"); self.ack_btn.setObjectName("primary")
         self.ack_btn.setEnabled(False); self.ack_btn.clicked.connect(self._ack)
         self.ack_btn.setVisible(can_ack)
         sl.addWidget(self.ack_btn)
-        self.alerts.itemSelectionChanged.connect(lambda: self.ack_btn.setEnabled(bool(self.alerts.selectedItems())))
+        self.alerts.itemSelectionChanged.connect(self._selection_changed)
         root.addWidget(side)
 
     # ---- cameras and video
@@ -117,16 +117,14 @@ class DashboardPage(QWidget):
         if t: t.set_image(img)
 
     def update_status(self, statuses: dict):
-        total, worst = 0, "low"
+        worst = "low"
         order = {"low": 0, "medium": 1, "high": 2}
         for cid, st in statuses.items():
             t = self.tiles.get(cid)
             if t:
                 t.set_state(st.get("state", "ok"), st.get("fps", 0), st.get("message", ""))
-            total += st.get("vehicles", 0)
             if order.get(st.get("level", "low"), 0) > order[worst]:
                 worst = st["level"]
-        self.c_veh.set(total)
         self.c_cong.set(worst.capitalize(), {"low": config.BRAND["green"], "medium": config.BRAND["amber"], "high": config.BRAND["red"]}[worst])
 
     def set_audio(self, text: str, healthy: bool):
@@ -141,13 +139,25 @@ class DashboardPage(QWidget):
         self.c_conf.set(confirmed_today, config.BRAND["red"] if confirmed_today else None)
         self.c_open.set(waiting, config.BRAND["orange"] if waiting else None)
 
-    def set_chart(self, values):
-        self.chart.set_values(values)
+    def set_chart(self, minutes, series):
+        self.chart.set_data(minutes, series)
+
+    def mark_acknowledged(self, alert_id: int, username: str):
+        self.alerts.mark_acknowledged(alert_id, username)
+        self._selection_changed()
+
+    def _selection_changed(self):
+        selected = self.alerts.selectedItems()
+        self.ack_btn.setEnabled(any(
+            item.data(Qt.UserRole) is not None and not (item.data(Qt.UserRole + 1) or {}).get("ack_by")
+            for item in selected))
 
     def _ack(self):
         for it in self.alerts.selectedItems():
             aid = it.data(Qt.UserRole)
-            if aid: self.acknowledge_requested.emit(aid)
+            alert = it.data(Qt.UserRole + 1) or {}
+            if aid is not None and not alert.get("ack_by"):
+                self.acknowledge_requested.emit(aid)
 
 
 # ---------------------------------------------------------------- history
@@ -162,7 +172,7 @@ class HistoryPage(QWidget):
         lay = QVBoxLayout(self); lay.setContentsMargins(12, 12, 12, 12)
         bar = QHBoxLayout()
         self.cam = QComboBox(); self.typ = QComboBox(); self.sev = QComboBox()
-        self.typ.addItems(["All types", "accident", "collision", "sudden_stop", "stationary", "overspeed", "congestion"])
+        self.typ.addItems(["All types", "accident", "stationary", "overspeed", "congestion"])
         self.sev.addItems(["Any severity", "Medium and above", "High and above", "Critical only"])
         self.since = QDateTimeEdit(QDateTime.currentDateTime().addDays(-7)); self.since.setCalendarPopup(True)
         self.since.setDisplayFormat("yyyy-MM-dd HH:mm")
@@ -410,7 +420,8 @@ class MapCanvas(QWidget):
             if c.get("map_x") is None: continue
             st = self.state.get(c["id"], "ok")
             col = {"ok": config.BRAND["green"], "suspected": config.BRAND["orange"], "confirmed": config.BRAND["red"],
-                   "reconnecting": config.BRAND["amber"], "stopped": "#66798C", "error": config.BRAND["red"]}.get(st, "#66798C")
+                   "reconnecting": config.BRAND["amber"], "warning": config.BRAND["amber"],
+                   "stopped": "#66798C", "error": config.BRAND["red"]}.get(st, "#66798C")
             x, y = r.x() + c["map_x"] * r.width(), r.y() + c["map_y"] * r.height()
             rad = 12 if st in ("suspected", "confirmed") and self.flash else 8
             p.setBrush(QColor(col)); p.setPen(QPen(QColor("white"), 2)); p.drawEllipse(QPointF(x, y), rad, rad)
@@ -480,7 +491,7 @@ class DiagnosticsPage(QWidget):
         self.db = database
         lay = QVBoxLayout(self); lay.setContentsMargins(12, 12, 12, 12)
         self.sys = QLabel(""); self.sys.setObjectName("dim")
-        self.table = _table(["Camera", "State", "Display fps", "Frames analysed", "Detect ms", "Track and rules ms", "Total ms",
+        self.table = _table(["Camera", "State", "Status detail", "Display fps", "Frames analysed", "Detect ms", "Track and rules ms", "Total ms",
                              "Vehicles", "Tracked", "Detector", "Temporal"])
         self.notes = QLabel(""); self.notes.setWordWrap(True); self.notes.setObjectName("dim")
         lay.addWidget(QLabel("Pipeline timings")); lay.addWidget(self.table, 1); lay.addWidget(self.sys); lay.addWidget(self.notes)
@@ -490,7 +501,7 @@ class DiagnosticsPage(QWidget):
         notes = set()
         for r, (cid, st) in enumerate(sorted(statuses.items())):
             t = st.get("timings", {})
-            vals = [names.get(cid, str(cid)), st.get("state", ""), st.get("fps", ""), st.get("analysed", ""), t.get("detect", ""),
+            vals = [names.get(cid, str(cid)), st.get("state", ""), st.get("message", ""), st.get("fps", ""), st.get("analysed", ""), t.get("detect", ""),
                     t.get("track_rules", ""), t.get("total", ""), st.get("vehicles", ""), st.get("tracks", ""),
                     st.get("detector", ""), st.get("temporal", "")]
             for c, v in enumerate(vals): self.table.setItem(r, c, QTableWidgetItem(str(v)))
@@ -522,6 +533,11 @@ class AdminPage(QWidget):
             b = QPushButton(text); b.clicked.connect(fn); row.addWidget(b)
         row.addStretch(1)
         lay.addWidget(self.users, 1); lay.addLayout(row)
+        from .dialogs import RegistrationKeysDialog
+        self.keys_button = QPushButton("Role signup keys...")
+        self.keys_button.clicked.connect(lambda: self._registration_keys(RegistrationKeysDialog))
+        self.keys_button.setVisible(self.me["id"] == self.db.owner_user_id())
+        row.addWidget(self.keys_button)
         lay.addWidget(QLabel("Audit log"))
         self.audit = _table(["Time", "User", "Action", "Target"]); lay.addWidget(self.audit, 1)
         self.rows: list[dict] = []
@@ -549,6 +565,10 @@ class AdminPage(QWidget):
         from .dialogs import UserDialog
         if UserDialog(self.db, self).exec():
             self.db.audit(self.me["username"], "add user"); self.refresh()
+
+    def _registration_keys(self, dialog_type):
+        if dialog_type(self.db, self.me, self).exec():
+            self.db.audit(self.me["username"], "change registration keys")
 
     def role(self):
         u = self._sel()

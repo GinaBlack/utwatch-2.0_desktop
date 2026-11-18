@@ -25,6 +25,13 @@ def test_settings_validation():
         config.validate_latlon("95", "0")
 
 
+def test_black_frame_detection_does_not_claim_disconnection():
+    import numpy as np
+    from utwatch.pipeline.source import is_nearly_black_frame
+    assert is_nearly_black_frame(np.zeros((64, 64, 3), dtype=np.uint8))
+    assert not is_nearly_black_frame(np.full((64, 64, 3), 18, dtype=np.uint8))
+
+
 def test_password_rules_and_hashing():
     s = security.new_salt()
     h = security.hash_password("Secret123", s)
@@ -53,6 +60,19 @@ def test_users_roles_lockout(tmp_path):
     assert d.authenticate("admin", "NewPass123")["username"] == "admin"
     with pytest.raises(ValueError):
         d.create_user("admin", "Admin1234")
+
+
+def test_role_signup_keys_are_admin_managed_and_hashed(tmp_path):
+    d = db.Database(tmp_path / "keys.db")
+    d.create_user("owner", "Owner12345", "administrator")
+    d.create_user("operator", "Operator123", "officer")
+    owner_id = d.owner_user_id()
+    d.set_registration_key("officer", "OfficerKey123", owner_id)
+    with pytest.raises(db.AuthError, match="invalid"):
+        d.register_user("bad", "BadUser123", "officer", "wrong")
+    d.register_user("good", "GoodUser123", "officer", "OfficerKey123")
+    with pytest.raises(db.AuthError, match="first administrator"):
+        d.set_registration_key("officer", "ChangedKey123", 2)
 
 
 def test_permissions():

@@ -3,8 +3,14 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import sys
 
 APP_NAME = "UTWatch"
+MODEL_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent)) / "models"
+
+
+def model_path(filename: str) -> str:
+    return str(MODEL_DIR / filename)
 
 # Brand palette from the UTWatch brand sheet, plus the two severity colours the sheet lacks.
 BRAND = {
@@ -44,30 +50,25 @@ SETTING_SPECS: dict[str, tuple] = {
     "window_seconds": (float, 2.0, 8.0, 5.0, "Analysis window (seconds); pilot decides 4 or 5"),
     "window_hop_seconds": (float, 0.25, 4.0, 1.0, "Hop between window evaluations (seconds)"),
     "alert_cooldown_seconds": (float, 1.0, 120.0, 5.0, "Cooldown per camera and alert type"),
-    "collision_iou": (float, 0.05, 0.95, 0.40, "Overlap that counts as contact"),
-    "collision_persist_frames": (int, 1, 20, 3, "Consecutive analysed frames of contact"),
-    "moving_speed": (float, 0.001, 1.0, 0.03, "Moving threshold (frame diagonals per second)"),
     "stationary_speed": (float, 0.0, 0.2, 0.008, "Stationary threshold (frame diagonals per second)"),
     "stationary_seconds": (float, 0.5, 120.0, 2.0, "Seconds stationary before an obstacle warning"),
-    "sudden_stop_drop": (float, 0.3, 0.99, 0.80, "Speed drop that counts as a sudden stop"),
     "aftermath_seconds": (float, 0.5, 6.0, 2.0, "Seconds of stillness that confirm an accident"),
     "overspeed_frames": (int, 1, 30, 3, "Consecutive frames above the limit"),
     "congestion_medium": (int, 1, 200, 6, "Vehicles for medium congestion"),
     "congestion_high": (int, 2, 400, 12, "Vehicles for high congestion"),
     "fusion_rule": (str, None, None, "or", "or, and, majority or weighted"),
-    "pre_roll_seconds": (float, 1.0, 60.0, 10.0, "Recording before an alert"),
-    "post_roll_seconds": (float, 1.0, 60.0, 10.0, "Recording after confirmation or expiry"),
     "record_fps": (float, 1.0, 30.0, 10.0, "Frames per second kept for recordings"),
     "storage_quota_gb": (float, 0.1, 500.0, 5.0, "Recording quota (gigabytes)"),
     "retention_days": (int, 1, 3650, 30, "Days to keep unprotected recordings"),
     "mute_alerts": (int, 0, 1, 0, "Mute audible alerts"),
-    "detector": (str, None, None, "motion", "Object detector plug-in"),
-    "temporal": (str, None, None, "none", "Temporal classifier plug-in"),
-    "audio": (str, None, None, "none", "Audio classifier plug-in"),
-    "detector_weights": (str, None, None, "", "Path to detector weights"),
-    "temporal_weights": (str, None, None, "", "Path to temporal model weights"),
-    "audio_weights": (str, None, None, "", "Path to audio model weights"),
-    "cloud_sync": (int, 0, 1, 0, "Send non-personal metadata to the cloud"),
+    "detector": (str, None, None, "ultralytics", "Object detector plug-in"),
+    "temporal": (str, None, None, "accident_convlstm", "Visual accident classifier"),
+    "audio": (str, None, None, "trained_audio", "Audio accident classifier"),
+    "detector_weights": (str, None, None, model_path("best.pt"), "Path to detector weights"),
+    "temporal_weights": (str, None, None, model_path("accident_classifier(1).pth"), "Path to visual model weights"),
+    "audio_weights": (str, None, None, model_path("audio_model.pth"), "Path to audio model weights"),
+    "audio_scaler_weights": (str, None, None, model_path("scaler.pkl"), "Path to audio feature scaler"),
+    "hidden_classes": (str, None, None, "", "Comma-separated object classes hidden from the live display"),
 }
 
 FUSION_RULES = ("or", "and", "majority", "weighted")

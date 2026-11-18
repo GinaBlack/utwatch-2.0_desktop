@@ -11,6 +11,7 @@ import cv2
 import numpy as np
 
 MAX_MANUAL_SECONDS = 600
+EVENT_RECORDING_SECONDS = 60.0
 
 
 def _jpeg(frame, quality=75) -> bytes:
@@ -57,11 +58,12 @@ class EventRecorder:
         if not data:
             return
         self.ring.append((t, data))
-        horizon = t - self.s["pre_roll_seconds"] - 1.0
+        horizon = t - EVENT_RECORDING_SECONDS / 2 - 1.0
         while self.ring and self.ring[0][0] < horizon:
             self.ring.popleft()
         for clip in self.clips.values():
-            clip.frames.append((t, data))
+            if clip.close_at is None or t <= clip.close_at:
+                clip.frames.append((t, data))
         if self._manual is not None:
             self._write_manual(t, frame_bgr)
 
@@ -69,13 +71,18 @@ class EventRecorder:
     def start_event(self, incident_id: str, t: float) -> None:
         if incident_id in self.clips:
             return
-        pre = [(ft, d) for (ft, d) in self.ring if ft >= t - self.s["pre_roll_seconds"]]
-        self.clips[incident_id] = _Clip(incident_id, self.camera_id, self.camera_name, pre[0][0] if pre else t, pre)
+        start = t - EVENT_RECORDING_SECONDS / 2
+        pre = [(ft, d) for (ft, d) in self.ring if ft >= start]
+        clip = _Clip(incident_id, self.camera_id, self.camera_name, start, pre)
+        clip.close_at = t + EVENT_RECORDING_SECONDS / 2
+        self.clips[incident_id] = clip
 
     def end_event(self, incident_id: str, t: float, outcome: str) -> None:
         clip = self.clips.get(incident_id)
         if clip is not None and clip.close_at is None:
-            clip.close_at = t + self.s["post_roll_seconds"]
+            clip.close_at = t + EVENT_RECORDING_SECONDS / 2
+            clip.outcome = outcome
+        elif clip is not None:
             clip.outcome = outcome
 
     def tick(self, t: float) -> None:
@@ -101,7 +108,7 @@ class EventRecorder:
     def _finalise(self, clip: _Clip) -> None:
         if len(clip.frames) < 2:
             return
-        stamp = time.strftime("%Y%m%d_%H%M%S", time.localtime(clip.t_start))
+        stamp = time.strftime("%Y%m%d_%H%M%S", time.localtime(max(0.0, clip.t_start)))
         base = self.folder / f"{_safe(self.camera_name)}_{stamp}_{_safe(clip.incident_id)}"
         path = str(base) + ".mp4"
         first = cv2.imdecode(np.frombuffer(clip.frames[0][1], np.uint8), cv2.IMREAD_COLOR)

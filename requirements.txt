@@ -4,6 +4,9 @@ opencv-python-headless>=4.8        # headless build avoids a Qt plug-in clash wi
 numpy>=1.24
 psutil>=5.9
 
-# Optional (add when you want them)
-# sounddevice>=0.4                 # microphone input for the audio monitor
-# ultralytics                      # YOLO11n detector plug-in (AGPL-3.0: release your code under AGPL-3.0 or buy a licence)
+# Bundled UTWatch models: YOLO detection, ConvLSTM accident classification, and MFCC audio classification.
+torch>=2.6
+ultralytics>=8.3
+scikit-learn>=1.4
+librosa>=0.10
+sounddevice>=0.4

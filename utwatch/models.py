@@ -59,7 +59,7 @@ class Detection:
 @dataclass
 class Cue:
     """One piece of evidence produced by the rules."""
-    kind: str                      # collision, sudden_stop, stationary, overspeed
+    kind: str                      # stationary, overspeed
     severity: Severity
     t: float
     track_ids: tuple = ()

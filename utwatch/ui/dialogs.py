@@ -6,6 +6,7 @@ import cv2
 from PySide6.QtCore import QPointF, Qt, Signal
 from PySide6.QtGui import QColor, QImage, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFileDialog, QFormLayout,
+                               QGridLayout,
                                QFrame, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPushButton, QScrollArea, QSpinBox,
                                QTabWidget, QVBoxLayout, QWidget, QWizard, QWizardPage)
 
@@ -54,8 +55,10 @@ class LoginDialog(QDialog):
         self.err = _error_label()
         btn = QPushButton("Sign in"); btn.setObjectName("primary"); btn.setDefault(True)
         btn.clicked.connect(self._try)
+        register = QPushButton("Create account...")
+        register.clicked.connect(self._register)
         for w in (title, sub): lay.addWidget(w)
-        lay.addSpacing(8); lay.addLayout(form); lay.addWidget(self.err); lay.addWidget(btn)
+        lay.addSpacing(8); lay.addLayout(form); lay.addWidget(self.err); lay.addWidget(btn); lay.addWidget(register)
         self.pw.returnPressed.connect(self._try)
 
     def _try(self):
@@ -68,6 +71,12 @@ class LoginDialog(QDialog):
             self.pw.clear()
             self.pw.setFocus()
 
+    def _register(self):
+        dlg = RegistrationDialog(self.db, self)
+        if dlg.exec():
+            self.name.setText(dlg.name.text().strip())
+            self.pw.setFocus()
+
 
 class _AdminPage(QWizardPage):
     def __init__(self):
@@ -76,8 +85,13 @@ class _AdminPage(QWizardPage):
         self.setSubTitle("This account manages cameras, settings and other users.")
         form = QFormLayout(self)
         self.user = QLineEdit(); self.pw = QLineEdit(); self.pw2 = QLineEdit()
-        for e in (self.pw, self.pw2): e.setEchoMode(QLineEdit.Password)
+        self.admin_key = QLineEdit(); self.officer_key = QLineEdit(); self.responder_key = QLineEdit()
+        for e in (self.pw, self.pw2, self.admin_key, self.officer_key, self.responder_key):
+            e.setEchoMode(QLineEdit.Password)
         form.addRow("Username", self.user); form.addRow("Password", self.pw); form.addRow("Repeat password", self.pw2)
+        form.addRow("Administrator signup key", self.admin_key)
+        form.addRow("Traffic officer signup key", self.officer_key)
+        form.addRow("Responder signup key", self.responder_key)
         self.err = _error_label(); form.addRow(self.err)
 
     def validatePage(self):
@@ -88,6 +102,8 @@ class _AdminPage(QWizardPage):
             check_password_rules(self.pw.text())
             if self.pw.text() != self.pw2.text():
                 raise ValueError("The two passwords do not match")
+            for key in (self.admin_key.text(), self.officer_key.text(), self.responder_key.text()):
+                check_password_rules(key)
         except ValueError as exc:
             self.err.setText(str(exc)); return False
         return True
@@ -132,6 +148,10 @@ class SetupWizard(QWizard):
     def accept(self):
         try:
             self.db.create_user(self.admin.user.text(), self.admin.pw.text(), "administrator")
+            owner_id = self.db.owner_user_id()
+            self.db.set_registration_key("administrator", self.admin.admin_key.text(), owner_id)
+            self.db.set_registration_key("officer", self.admin.officer_key.text(), owner_id)
+            self.db.set_registration_key("responder", self.admin.responder_key.text(), owner_id)
             if self.cam.src.text().strip():
                 self.db.add_camera(self.cam.name.text(), self.cam.src.text())
         except ValueError as exc:
@@ -298,14 +318,17 @@ class CalibrationDialog(QDialog):
 
 
 class SettingsDialog(QDialog):
+    OBJECT_CLASSES = ("car", "truck", "bus", "motorcycle", "person", "animal", "vehicle", "object", "accident")
     GROUPS = {
         "Analysis": ["analysis_fps", "analysis_width", "window_seconds", "window_hop_seconds", "fusion_rule"],
-        "Incident rules": ["collision_iou", "collision_persist_frames", "moving_speed", "stationary_speed", "stationary_seconds",
-                           "sudden_stop_drop", "aftermath_seconds", "overspeed_frames", "congestion_medium", "congestion_high"],
-        "Alerts and recording": ["alert_cooldown_seconds", "mute_alerts", "pre_roll_seconds", "post_roll_seconds", "record_fps",
+        "Incident rules": ["stationary_speed", "stationary_seconds", "aftermath_seconds", "overspeed_frames",
+                           "congestion_medium", "congestion_high"],
+        "Alerts and recording": ["alert_cooldown_seconds", "mute_alerts", "record_fps",
                                  "storage_quota_gb", "retention_days"],
-        "Models": ["detector", "detector_weights", "temporal", "temporal_weights", "audio", "audio_weights"],
-        "Cloud": ["cloud_sync"],
+        "Models": ["detector", "detector_weights", "temporal", "temporal_weights", "audio", "audio_weights",
+                   "audio_scaler_weights"],
+        "Object display": ["hidden_classes"],
+        "Cloud": [],
     }
 
     def __init__(self, database, parent=None):
@@ -315,16 +338,32 @@ class SettingsDialog(QDialog):
         self.resize(560, 560)
         self.values = database.get_settings()
         self.editors: dict = {}
+        self.class_checks = {}
+        hidden = set(filter(None, self.values.get("hidden_classes", "").split(",")))
         tabs = QTabWidget()
         avail = plugins.available()
         choices = {"fusion_rule": config.FUSION_RULES, "detector": avail["detector"], "temporal": avail["temporal"], "audio": avail["audio"]}
         for group, keys in self.GROUPS.items():
             page = QWidget(); form = QFormLayout(page)
+            if group == "Cloud":
+                for text in ("Cloud sync is not connected. All data remains on this computer.",
+                             "The future implementation is planned to include incident metadata, snapshots, and recordings; provider and retention settings are pending the storage design discussion."):
+                    info = QLabel(text); info.setWordWrap(True); form.addRow(info)
             for k in keys:
                 typ, lo, hi, _d, desc = config.SETTING_SPECS[k]
+                if k == "hidden_classes":
+                    box = QWidget(); row = QGridLayout(box); row.setContentsMargins(0, 0, 0, 0)
+                    for ix, label in enumerate(self.OBJECT_CLASSES):
+                        check = QCheckBox(label.capitalize())
+                        check.setChecked(label not in hidden)
+                        self.class_checks[label] = check
+                        row.addWidget(check, ix // 4, ix % 4)
+                    self.editors[k] = box
+                    form.addRow("Visible classes (detection remains active)", box)
+                    continue
                 if k in choices:
                     w = QComboBox(); w.addItems(list(choices[k])); w.setCurrentText(str(self.values[k]))
-                elif k in ("mute_alerts", "cloud_sync"):
+                elif k == "mute_alerts":
                     w = QCheckBox(); w.setChecked(bool(self.values[k]))
                 elif typ is int:
                     w = QSpinBox(); w.setRange(lo, hi); w.setValue(int(self.values[k]))
@@ -344,6 +383,8 @@ class SettingsDialog(QDialog):
 
     def _read(self, k):
         w = self.editors[k]
+        if k == "hidden_classes":
+            return ",".join(label for label, check in self.class_checks.items() if not check.isChecked())
         if isinstance(w, QComboBox): return w.currentText()
         if isinstance(w, QCheckBox): return int(w.isChecked())
         if isinstance(w, (QSpinBox, QDoubleSpinBox)): return w.value()
@@ -379,19 +420,54 @@ class AlertModal(QDialog):
         info = QLabel(f"{alert['camera_name']}\n{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(alert['ts']))}\n"
                       f"Severity: {Severity(alert['severity']).label}")
         lay.addWidget(band); lay.addWidget(head); lay.addWidget(info)
-        btn = QPushButton("Acknowledge" if can_ack else "Close"); btn.setObjectName("danger" if can_ack else "primary")
-        btn.clicked.connect(self._done); lay.addWidget(btn)
+        row = QHBoxLayout()
+        dismiss = QPushButton("Dismiss" if can_ack else "Close")
+        dismiss.clicked.connect(self.reject)
+        row.addWidget(dismiss)
+        if can_ack:
+            btn = QPushButton("Acknowledge"); btn.setObjectName("danger")
+            btn.clicked.connect(self._done)
+            row.addWidget(btn)
+        lay.addLayout(row)
         self.setMinimumWidth(380)
 
     def _done(self):
         self._ack = True
-        if self.can_ack and self.alert_id:
+        if self.can_ack and self.alert_id is not None:
             self.acknowledged.emit(self.alert_id)
         self.accept()
 
-    def reject(self):                       # Escape and the window close button do nothing until acknowledged
-        if self._ack or not self.can_ack:
-            super().reject()
+    def reject(self):
+        super().reject()
+
+
+class RegistrationDialog(QDialog):
+    def __init__(self, database, parent=None):
+        super().__init__(parent)
+        self.db = database
+        self.setWindowTitle("Create UTWatch account")
+        form = QFormLayout()
+        self.name = QLineEdit()
+        self.role = QComboBox(); self.role.addItems(ROLES); self.role.setCurrentText("officer")
+        self.key = QLineEdit(); self.key.setEchoMode(QLineEdit.Password)
+        self.password = QLineEdit(); self.password.setEchoMode(QLineEdit.Password)
+        self.repeat = QLineEdit(); self.repeat.setEchoMode(QLineEdit.Password)
+        form.addRow("Username", self.name); form.addRow("Operator role", self.role)
+        form.addRow("Role signup key", self.key)
+        form.addRow("Password", self.password); form.addRow("Repeat password", self.repeat)
+        self.err = _error_label()
+        buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self._save); buttons.rejected.connect(self.reject)
+        layout = QVBoxLayout(self); layout.addLayout(form); layout.addWidget(self.err); layout.addWidget(buttons)
+
+    def _save(self):
+        try:
+            if self.password.text() != self.repeat.text():
+                raise ValueError("The two passwords do not match")
+            self.db.register_user(self.name.text(), self.password.text(), self.role.currentText(), self.key.text())
+        except (ValueError, AuthError) as exc:
+            self.err.setText(str(exc)); return
+        self.accept()
 
 
 class UserDialog(QDialog):
@@ -401,16 +477,48 @@ class UserDialog(QDialog):
         self.setWindowTitle("Add user")
         form = QFormLayout()
         self.name = QLineEdit(); self.pw = QLineEdit(); self.pw.setEchoMode(QLineEdit.Password)
+        self.key = QLineEdit(); self.key.setEchoMode(QLineEdit.Password)
         self.role = QComboBox(); self.role.addItems(ROLES); self.role.setCurrentText("officer")
         self.err = _error_label()
-        form.addRow("Username", self.name); form.addRow("Temporary password", self.pw); form.addRow("Role", self.role)
+        form.addRow("Username", self.name); form.addRow("Temporary password", self.pw)
+        form.addRow("Role signup key", self.key); form.addRow("Role", self.role)
         bb = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
         bb.accepted.connect(self._save); bb.rejected.connect(self.reject)
         lay = QVBoxLayout(self); lay.addLayout(form); lay.addWidget(self.err); lay.addWidget(bb)
 
     def _save(self):
         try:
-            self.db.create_user(self.name.text(), self.pw.text(), self.role.currentText())
-        except ValueError as exc:
+            self.db.register_user(self.name.text(), self.pw.text(), self.role.currentText(), self.key.text())
+        except (ValueError, AuthError) as exc:
+            self.err.setText(str(exc)); return
+        self.accept()
+
+
+class RegistrationKeysDialog(QDialog):
+    def __init__(self, database, user: dict, parent=None):
+        super().__init__(parent)
+        self.db, self.user = database, user
+        self.setWindowTitle("Role signup keys")
+        form = QFormLayout()
+        self.fields = {}
+        for role, label in (("administrator", "Administrator"), ("officer", "Traffic officer"),
+                            ("responder", "Responder")):
+            edit = QLineEdit(); edit.setEchoMode(QLineEdit.Password)
+            edit.setPlaceholderText("Configured — enter a replacement" if database.registration_key_configured(role)
+                                    else "Not configured — enter an initial key")
+            self.fields[role] = edit
+            form.addRow(f"{label} key", edit)
+        self.err = _error_label()
+        buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self._save); buttons.rejected.connect(self.reject)
+        layout = QVBoxLayout(self); layout.addWidget(QLabel("Only the first administrator can change these keys."))
+        layout.addLayout(form); layout.addWidget(self.err); layout.addWidget(buttons)
+
+    def _save(self):
+        try:
+            for role, field in self.fields.items():
+                if field.text():
+                    self.db.set_registration_key(role, field.text(), self.user["id"])
+        except (ValueError, AuthError) as exc:
             self.err.setText(str(exc)); return
         self.accept()

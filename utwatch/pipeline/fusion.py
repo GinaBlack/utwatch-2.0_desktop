@@ -6,11 +6,11 @@ WEIGHTED_THRESHOLD = 0.5
 
 
 def decide(rule: str, video: bool, temporal: bool, audio: bool) -> bool:
-    """or: any flag. and: video and audio. majority: two of three. weighted: score at least 0.5."""
+    """Combine visual-rule, temporal-model and audio evidence."""
     if rule == "or":
         return video or temporal or audio
     if rule == "and":
-        return video and audio
+        return (video or temporal) and audio
     if rule == "majority":
         return (int(video) + int(temporal) + int(audio)) >= 2
     if rule == "weighted":
